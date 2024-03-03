@@ -1,0 +1,12 @@
+apiVersion: ferretdb.ferretdb.com/v1alpha1
+kind: FerretDB
+metadata:
+  labels:
+    app.kubernetes.io/name: ferretdb
+    app.kubernetes.io/instance: ferretdb-sample
+    app.kubernetes.io/part-of: ferretdb-operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: ferretdb-operator
+  name: ferretdb-sample
+spec:
+  # TODO(user): Add fields here

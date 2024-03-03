@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- ferretdb_v1alpha1_ferretdb.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples

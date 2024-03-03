@@ -1,0 +1,27 @@
+# permissions for end users to view ferretdbs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: clusterrole
+    app.kubernetes.io/instance: ferretdb-viewer-role
+    app.kubernetes.io/component: rbac
+    app.kubernetes.io/created-by: ferretdb-operator
+    app.kubernetes.io/part-of: ferretdb-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: ferretdb-viewer-role
+rules:
+- apiGroups:
+  - ferretdb.ferretdb.com
+  resources:
+  - ferretdbs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ferretdb.ferretdb.com
+  resources:
+  - ferretdbs/status
+  verbs:
+  - get
