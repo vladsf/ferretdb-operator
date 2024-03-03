@@ -10,3 +10,4 @@ metadata:
   name: ferretdb-sample
 spec:
   # TODO(user): Add fields here
+  containerPort: 27017

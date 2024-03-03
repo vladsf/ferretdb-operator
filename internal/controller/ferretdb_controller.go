@@ -18,45 +18,384 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	ferretdbv1alpha1 "github.com/vladsf/ferretdb-operator/api/v1alpha1"
 )
 
+const ferretdbFinalizer = "ferretdb.ferretdb.com/finalizer"
+
+// Definitions to manage status conditions
+const (
+	// typeAvailableFerretDB represents the status of the Deployment reconciliation
+	typeAvailableFerretDB = "Available"
+	// typeDegradedFerretDB represents the status used when the custom resource is deleted and the finalizer operations are must to occur.
+	typeDegradedFerretDB = "Degraded"
+)
+
 // FerretDBReconciler reconciles a FerretDB object
 type FerretDBReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
+
+// The following markers are used to generate the rules permissions (RBAC) on config/rbac using controller-gen
+// when the command <make manifests> is executed.
+// To know more about markers see: https://book.kubebuilder.io/reference/markers.html
 
 //+kubebuilder:rbac:groups=ferretdb.ferretdb.com,resources=ferretdbs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=ferretdb.ferretdb.com,resources=ferretdbs/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=ferretdb.ferretdb.com,resources=ferretdbs/finalizers,verbs=update
+//+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the FerretDB object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.15.0/pkg/reconcile
+// It is essential for the controller's reconciliation loop to be idempotent. By following the Operator
+// pattern you will create Controllers which provide a reconcile function
+// responsible for synchronizing resources until the desired state is reached on the cluster.
+// Breaking this recommendation goes against the design principles of controller-runtime.
+// and may lead to unforeseen consequences such as resources becoming stuck and requiring manual intervention.
+// For further info:
+// - About Operator Pattern: https://kubernetes.io/docs/concepts/extend-kubernetes/operator/
+// - About Controllers: https://kubernetes.io/docs/concepts/architecture/controller/
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.16.3/pkg/reconcile
 func (r *FerretDBReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = log.FromContext(ctx)
+	log := log.FromContext(ctx)
 
-	// TODO(user): your logic here
+	// Fetch the FerretDB instance
+	// The purpose is check if the Custom Resource for the Kind FerretDB
+	// is applied on the cluster if not we return nil to stop the reconciliation
+	ferretdb := &ferretdbv1alpha1.FerretDB{}
+	err := r.Get(ctx, req.NamespacedName, ferretdb)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			// If the custom resource is not found then, it usually means that it was deleted or not created
+			// In this way, we will stop the reconciliation
+			log.Info("ferretdb resource not found. Ignoring since object must be deleted")
+			return ctrl.Result{}, nil
+		}
+		// Error reading the object - requeue the request.
+		log.Error(err, "Failed to get ferretdb")
+		return ctrl.Result{}, err
+	}
+
+	// Let's just set the status as Unknown when no status are available
+	if ferretdb.Status.Conditions == nil || len(ferretdb.Status.Conditions) == 0 {
+		meta.SetStatusCondition(&ferretdb.Status.Conditions, metav1.Condition{Type: typeAvailableFerretDB, Status: metav1.ConditionUnknown, Reason: "Reconciling", Message: "Starting reconciliation"})
+		if err = r.Status().Update(ctx, ferretdb); err != nil {
+			log.Error(err, "Failed to update FerretDB status")
+			return ctrl.Result{}, err
+		}
+
+		// Let's re-fetch the ferretdb Custom Resource after update the status
+		// so that we have the latest state of the resource on the cluster and we will avoid
+		// raise the issue "the object has been modified, please apply
+		// your changes to the latest version and try again" which would re-trigger the reconciliation
+		// if we try to update it again in the following operations
+		if err := r.Get(ctx, req.NamespacedName, ferretdb); err != nil {
+			log.Error(err, "Failed to re-fetch ferretdb")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Let's add a finalizer. Then, we can define some operations which should
+	// occurs before the custom resource to be deleted.
+	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers
+	if !controllerutil.ContainsFinalizer(ferretdb, ferretdbFinalizer) {
+		log.Info("Adding Finalizer for FerretDB")
+		if ok := controllerutil.AddFinalizer(ferretdb, ferretdbFinalizer); !ok {
+			log.Error(err, "Failed to add finalizer into the custom resource")
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		if err = r.Update(ctx, ferretdb); err != nil {
+			log.Error(err, "Failed to update custom resource to add finalizer")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Check if the FerretDB instance is marked to be deleted, which is
+	// indicated by the deletion timestamp being set.
+	isFerretDBMarkedToBeDeleted := ferretdb.GetDeletionTimestamp() != nil
+	if isFerretDBMarkedToBeDeleted {
+		if controllerutil.ContainsFinalizer(ferretdb, ferretdbFinalizer) {
+			log.Info("Performing Finalizer Operations for FerretDB before delete CR")
+
+			// Let's add here an status "Downgrade" to define that this resource begin its process to be terminated.
+			meta.SetStatusCondition(&ferretdb.Status.Conditions, metav1.Condition{Type: typeDegradedFerretDB,
+				Status: metav1.ConditionUnknown, Reason: "Finalizing",
+				Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s in namespace: %s", ferretdb.Name, ferretdb.Namespace)})
+
+			if err := r.Status().Update(ctx, ferretdb); err != nil {
+				log.Error(err, "Failed to update FerretDB status")
+				return ctrl.Result{}, err
+			}
+
+			// Perform all operations required before remove the finalizer and allow
+			// the Kubernetes API to remove the custom resource.
+			r.doFinalizerOperationsForFerretDB(ferretdb)
+
+			// TODO(user): If you add operations to the doFinalizerOperationsForFerretDB method
+			// then you need to ensure that all worked fine before deleting and updating the Downgrade status
+			// otherwise, you should requeue here.
+
+			// Re-fetch the ferretdb Custom Resource before update the status
+			// so that we have the latest state of the resource on the cluster and we will avoid
+			// raise the issue "the object has been modified, please apply
+			// your changes to the latest version and try again" which would re-trigger the reconciliation
+			if err := r.Get(ctx, req.NamespacedName, ferretdb); err != nil {
+				log.Error(err, "Failed to re-fetch ferretdb")
+				return ctrl.Result{}, err
+			}
+
+			meta.SetStatusCondition(&ferretdb.Status.Conditions, metav1.Condition{Type: typeDegradedFerretDB,
+				Status: metav1.ConditionTrue, Reason: "Finalizing",
+				Message: fmt.Sprintf("Finalizer operations for custom resource %s name were successfully accomplished", ferretdb.Name)})
+
+			if err := r.Status().Update(ctx, ferretdb); err != nil {
+				log.Error(err, "Failed to update FerretDB status")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Removing Finalizer for FerretDB after successfully perform the operations")
+			if ok := controllerutil.RemoveFinalizer(ferretdb, ferretdbFinalizer); !ok {
+				log.Error(err, "Failed to remove finalizer for FerretDB")
+				return ctrl.Result{Requeue: true}, nil
+			}
+
+			if err := r.Update(ctx, ferretdb); err != nil {
+				log.Error(err, "Failed to remove finalizer for FerretDB")
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Check if the deployment already exists, if not create a new one
+	found := &appsv1.Deployment{}
+	err = r.Get(ctx, types.NamespacedName{Name: ferretdb.Name, Namespace: ferretdb.Namespace}, found)
+	if err != nil && apierrors.IsNotFound(err) {
+		// Define a new deployment
+		dep, err := r.deploymentForFerretDB(ferretdb)
+		if err != nil {
+			log.Error(err, "Failed to define new Deployment resource for FerretDB")
+
+			// The following implementation will update the status
+			meta.SetStatusCondition(&ferretdb.Status.Conditions, metav1.Condition{Type: typeAvailableFerretDB,
+				Status: metav1.ConditionFalse, Reason: "Reconciling",
+				Message: fmt.Sprintf("Failed to create Deployment for the custom resource (%s): (%s)", ferretdb.Name, err)})
+
+			if err := r.Status().Update(ctx, ferretdb); err != nil {
+				log.Error(err, "Failed to update FerretDB status")
+				return ctrl.Result{}, err
+			}
+
+			return ctrl.Result{}, err
+		}
+
+		log.Info("Creating a new Deployment",
+			"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		if err = r.Create(ctx, dep); err != nil {
+			log.Error(err, "Failed to create new Deployment",
+				"Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			return ctrl.Result{}, err
+		}
+
+		// Deployment created successfully
+		// We will requeue the reconciliation so that we can ensure the state
+		// and move forward for the next operations
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	} else if err != nil {
+		log.Error(err, "Failed to get Deployment")
+		// Let's return the error for the reconciliation be re-trigged again
+		return ctrl.Result{}, err
+	}
+
+	// The following implementation will update the status
+	meta.SetStatusCondition(&ferretdb.Status.Conditions, metav1.Condition{Type: typeAvailableFerretDB,
+		Status: metav1.ConditionTrue, Reason: "Reconciling",
+		Message: fmt.Sprintf("Deployment for custom resource (%s) created successfully", ferretdb.Name)})
+
+	if err := r.Status().Update(ctx, ferretdb); err != nil {
+		log.Error(err, "Failed to update FerretDB status")
+		return ctrl.Result{}, err
+	}
 
 	return ctrl.Result{}, nil
 }
 
+// finalizeFerretDB will perform the required operations before delete the CR.
+func (r *FerretDBReconciler) doFinalizerOperationsForFerretDB(cr *ferretdbv1alpha1.FerretDB) {
+	// TODO(user): Add the cleanup steps that the operator
+	// needs to do before the CR can be deleted. Examples
+	// of finalizers include performing backups and deleting
+	// resources that are not owned by this CR, like a PVC.
+
+	// Note: It is not recommended to use finalizers with the purpose of delete resources which are
+	// created and managed in the reconciliation. These ones, such as the Deployment created on this reconcile,
+	// are defined as depended of the custom resource. See that we use the method ctrl.SetControllerReference.
+	// to set the ownerRef which means that the Deployment will be deleted by the Kubernetes API.
+	// More info: https://kubernetes.io/docs/tasks/administer-cluster/use-cascading-deletion/
+
+	// The following implementation will raise an event
+	r.Recorder.Event(cr, "Warning", "Deleting",
+		fmt.Sprintf("Custom Resource %s is being deleted from the namespace %s",
+			cr.Name,
+			cr.Namespace))
+}
+
+// deploymentForFerretDB returns a FerretDB Deployment object
+func (r *FerretDBReconciler) deploymentForFerretDB(
+	ferretdb *ferretdbv1alpha1.FerretDB) (*appsv1.Deployment, error) {
+	ls := labelsForFerretDB(ferretdb.Name)
+	var replicas int32 = 1
+
+	// Get the Operand image
+	image, err := imageForFerretDB()
+	if err != nil {
+		return nil, err
+	}
+
+	dep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ferretdb.Name,
+			Namespace: ferretdb.Namespace,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: ls,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: ls,
+				},
+				Spec: corev1.PodSpec{
+					// TODO(user): Uncomment the following code to configure the nodeAffinity expression
+					// according to the platforms which are supported by your solution. It is considered
+					// best practice to support multiple architectures. build your manager image using the
+					// makefile target docker-buildx. Also, you can use docker manifest inspect <image>
+					// to check what are the platforms supported.
+					// More info: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#node-affinity
+					//Affinity: &corev1.Affinity{
+					//	NodeAffinity: &corev1.NodeAffinity{
+					//		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					//			NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					//				{
+					//					MatchExpressions: []corev1.NodeSelectorRequirement{
+					//						{
+					//							Key:      "kubernetes.io/arch",
+					//							Operator: "In",
+					//							Values:   []string{"amd64", "arm64", "ppc64le", "s390x"},
+					//						},
+					//						{
+					//							Key:      "kubernetes.io/os",
+					//							Operator: "In",
+					//							Values:   []string{"linux"},
+					//						},
+					//					},
+					//				},
+					//			},
+					//		},
+					//	},
+					//},
+					SecurityContext: &corev1.PodSecurityContext{
+						// IMPORTANT: seccomProfile was introduced with Kubernetes 1.19
+						// If you are looking for to produce solutions to be supported
+						// on lower versions you must remove this option.
+						SeccompProfile: &corev1.SeccompProfile{
+							Type: corev1.SeccompProfileTypeRuntimeDefault,
+						},
+					},
+					Containers: []corev1.Container{{
+						Image:           image,
+						Name:            "ferretdb",
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						// Ensure restrictive context for the container
+						// More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+						SecurityContext: &corev1.SecurityContext{
+							AllowPrivilegeEscalation: &[]bool{false}[0],
+							Capabilities: &corev1.Capabilities{
+								Drop: []corev1.Capability{
+									"ALL",
+								},
+							},
+						},
+						Ports: []corev1.ContainerPort{{
+							ContainerPort: ferretdb.Spec.ContainerPort,
+							Name:          "ferretdb",
+						}},
+						Env: []corev1.EnvVar{{
+							Name:  "FERRETDB_LISTEN_ADDR",
+							Value: fmt.Sprintf(":%d", ferretdb.Spec.ContainerPort),
+						}},
+						Command: []string{"/ferretdb", "--handler=sqlite", "--state-dir=-", "--sqlite-url=file:./?mode=memory"},
+					}},
+				},
+			},
+		},
+	}
+
+	// Set the ownerRef for the Deployment
+	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/owners-dependents/
+	if err := ctrl.SetControllerReference(ferretdb, dep, r.Scheme); err != nil {
+		return nil, err
+	}
+	return dep, nil
+}
+
+// labelsForFerretDB returns the labels for selecting the resources
+// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/
+func labelsForFerretDB(name string) map[string]string {
+	var imageTag string
+	image, err := imageForFerretDB()
+	if err == nil {
+		imageTag = strings.Split(image, ":")[1]
+	}
+	return map[string]string{"app.kubernetes.io/name": "FerretDB",
+		"app.kubernetes.io/instance":   name,
+		"app.kubernetes.io/version":    imageTag,
+		"app.kubernetes.io/part-of":    "ferretdb-operator",
+		"app.kubernetes.io/created-by": "controller-manager",
+	}
+}
+
+// imageForFerretDB gets the Operand image which is managed by this controller
+// from the FERRETDB_IMAGE environment variable defined in the config/manager/manager.yaml
+func imageForFerretDB() (string, error) {
+	var imageEnvVar = "FERRETDB_IMAGE"
+	image, found := os.LookupEnv(imageEnvVar)
+	if !found {
+		return "", fmt.Errorf("Unable to find %s environment variable with the image", imageEnvVar)
+	}
+	return image, nil
+}
+
 // SetupWithManager sets up the controller with the Manager.
+// Note that the Deployment will be also watched in order to ensure its
+// desirable state on the cluster
 func (r *FerretDBReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ferretdbv1alpha1.FerretDB{}).
+		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }

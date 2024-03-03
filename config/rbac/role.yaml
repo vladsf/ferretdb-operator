@@ -1,0 +1,59 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ferretdb.ferretdb.com
+  resources:
+  - ferretdbs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ferretdb.ferretdb.com
+  resources:
+  - ferretdbs/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ferretdb.ferretdb.com
+  resources:
+  - ferretdbs/status
+  verbs:
+  - get
+  - patch
+  - update
